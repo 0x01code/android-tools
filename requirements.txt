@@ -1,0 +1,8 @@
+# Android Security Tools - Python Dependencies
+#
+# This script uses only Python standard library modules.
+# No external packages are required for basic functionality.
+#
+# Optional enhancements (not required):
+requests>=2.32.5  # Better HTTP handling than urllib
+# colorama>=0.4.6   # Cross-platform colored terminal output
