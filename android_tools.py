@@ -14,21 +14,118 @@ import platform
 import urllib.request
 import lzma
 import time
+import argparse
+import re
+import os
 from pathlib import Path
 from typing import List, Tuple
 
 # ====== Configuration ======
-CERT_FILE = "./tmp/burp_cert.cer"
+# These will be set by parse_arguments() in main()
+CERT_FILE = None
 DEVICE_CERT_DIR = "/system/etc/security/cacerts"
 
-FRIDA_VER = "17.5.2"
-FRIDA_ARCH = "android-arm64"
-FRIDA_URL = f"https://github.com/frida/frida/releases/download/{FRIDA_VER}/frida-server-{FRIDA_VER}-{FRIDA_ARCH}.xz"
+FRIDA_VER = None
+FRIDA_ARCH = None
+FRIDA_URL = None
+AUTO_DETECT_ARCH = False
 LOCAL_DIR = Path("../tmp").resolve()
-LOCAL_XZ = LOCAL_DIR / f"frida-server-{FRIDA_VER}-{FRIDA_ARCH}.xz"
+LOCAL_XZ = None
 LOCAL_BIN = LOCAL_DIR / "frida-server"
 REMOTE_BIN = "/data/local/tmp/frida-server"
 # ===========================
+
+
+def parse_arguments():
+    """Parse command-line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Android Security Tools - Burp Certificate & Frida Server',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  python android_tools.py
+  python android_tools.py --frida-version 16.0.0
+  python android_tools.py --frida-arch android-x86
+  python android_tools.py --auto-detect-arch
+  python android_tools.py --cert-file ./certs/my-burp.cer
+        '''
+    )
+
+    parser.add_argument(
+        '-v', '--frida-version',
+        default='17.5.2',
+        help='Frida server version (default: 17.5.2)'
+    )
+
+    parser.add_argument(
+        '-a', '--frida-arch',
+        help='Frida architecture: android-arm64, android-arm, android-x86_64, android-x86 (default: auto-detect or android-arm64)'
+    )
+
+    parser.add_argument(
+        '-c', '--cert-file',
+        default='./burp.cer',
+        help='Burp certificate file path (default: ./burp.cer)'
+    )
+
+    parser.add_argument(
+        '-d', '--auto-detect-arch',
+        action='store_true',
+        help='Auto-detect device architecture'
+    )
+
+    return parser.parse_args()
+
+
+def map_abi_to_frida_arch(abi: str) -> str:
+    """Map device ABI to Frida architecture name"""
+    mapping = {
+        'arm64-v8a': 'android-arm64',
+        'armeabi-v7a': 'android-arm',
+        'armeabi': 'android-arm',
+        'x86_64': 'android-x86_64',
+        'x86': 'android-x86'
+    }
+    return mapping.get(abi, 'android-arm64')  # Default to arm64
+
+
+def detect_device_arch(serial: str) -> str:
+    """Detect device architecture via ABI"""
+    cmd = ['adb', '-s', serial, 'shell', 'getprop', 'ro.product.cpu.abi']
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        abi = result.stdout.strip()
+        return map_abi_to_frida_arch(abi)
+    return 'android-arm64'  # Default fallback
+
+
+def validate_cert_file(path: str) -> bool:
+    """Validate certificate file exists and is readable"""
+    if not os.path.exists(path):
+        print(f"[!] ไม่พบไฟล์ certificate: {path}")
+        return False
+    if not os.access(path, os.R_OK):
+        print(f"[!] ไม่สามารถอ่านไฟล์ certificate: {path}")
+        return False
+    return True
+
+
+def validate_frida_version(version: str) -> bool:
+    """Validate Frida version format (x.y.z)"""
+    if not re.match(r'^\d+\.\d+\.\d+$', version):
+        print(f"[!] รูปแบบ version ไม่ถูกต้อง: {version} (ต้องเป็น x.y.z)")
+        return False
+    return True
+
+
+def validate_frida_arch(arch: str) -> bool:
+    """Validate Frida architecture name"""
+    valid_archs = ['android-arm64', 'android-arm', 'android-x86_64', 'android-x86']
+    if arch not in valid_archs:
+        print(f"[!] สถาปัตยกรรมไม่ถูกต้อง: {arch}")
+        print(f"    เลือกได้: {', '.join(valid_archs)}")
+        return False
+    return True
 
 
 def check_tool(tool_name: str) -> bool:
@@ -182,8 +279,10 @@ def choose_device() -> List[str]:
         return []
 
 
-def setup_frida_server(serial: str):
+def setup_frida_server(serial: str, auto_detect: bool = False):
     """Setup Frida server on a specific device"""
+    global FRIDA_ARCH, FRIDA_URL, LOCAL_XZ
+
     print(f"\n=== จัดการอุปกรณ์: {serial} ===")
 
     # Check device ABI
@@ -192,8 +291,25 @@ def setup_frida_server(serial: str):
     device_abi = result.stdout.strip()
     print(f"    ABI: {device_abi}")
 
-    if "arm64" not in device_abi:
-        print(f"[!] คำเตือน: อุปกรณ์อาจไม่ใช่ arm64 (ได้ {device_abi})")
+    # Auto-detect architecture if requested
+    if auto_detect:
+        detected_arch = map_abi_to_frida_arch(device_abi)
+        print(f"[*] ตรวจพบ architecture ของอุปกรณ์: {detected_arch}")
+        FRIDA_ARCH = detected_arch
+        # Update URLs with new architecture
+        FRIDA_URL = f"https://github.com/frida/frida/releases/download/{FRIDA_VER}/frida-server-{FRIDA_VER}-{FRIDA_ARCH}.xz"
+        LOCAL_XZ = LOCAL_DIR / f"frida-server-{FRIDA_VER}-{FRIDA_ARCH}.xz"
+    else:
+        # Show warning if architecture might mismatch
+        expected_abi_keywords = {
+            'android-arm64': 'arm64',
+            'android-arm': 'arm',
+            'android-x86_64': 'x86_64',
+            'android-x86': 'x86'
+        }
+        expected_keyword = expected_abi_keywords.get(FRIDA_ARCH, '')
+        if expected_keyword and expected_keyword not in device_abi:
+            print(f"[!] คำเตือน: อุปกรณ์ ABI ({device_abi}) อาจไม่ตรงกับ Frida arch ({FRIDA_ARCH})")
 
     # Download frida-server
     print(f"[*] ดาวน์โหลด frida-server: {FRIDA_URL}")
@@ -277,7 +393,7 @@ def run_frida_server():
 
     # Setup Frida on selected devices
     for serial in selected:
-        setup_frida_server(serial)
+        setup_frida_server(serial, auto_detect=AUTO_DETECT_ARCH)
 
         # Try to list processes with frida-ps
         print(f"[*] ทดลองรายการ process ด้วย frida-ps -D {serial}")
@@ -542,7 +658,43 @@ def install_tools():
 
 def main():
     """Main menu loop"""
+    global CERT_FILE, FRIDA_VER, FRIDA_ARCH, FRIDA_URL, LOCAL_XZ, AUTO_DETECT_ARCH
+
+    # Parse command-line arguments
+    args = parse_arguments()
+
+    # Validate inputs
+    if not validate_frida_version(args.frida_version):
+        sys.exit(1)
+
+    # Set global configuration from arguments
+    CERT_FILE = args.cert_file
+    FRIDA_VER = args.frida_version
+    AUTO_DETECT_ARCH = args.auto_detect_arch
+
+    # Handle architecture (auto-detect or use specified)
+    if args.frida_arch:
+        if not validate_frida_arch(args.frida_arch):
+            sys.exit(1)
+        FRIDA_ARCH = args.frida_arch
+    else:
+        # Will auto-detect per device in setup_frida_server() if AUTO_DETECT_ARCH is True
+        FRIDA_ARCH = 'android-arm64'  # Default fallback
+        if not args.auto_detect_arch:
+            # Only set auto-detect if not explicitly specified
+            AUTO_DETECT_ARCH = True  # Auto-detect by default when no arch specified
+
+    # Set URLs with configuration
+    FRIDA_URL = f"https://github.com/frida/frida/releases/download/{FRIDA_VER}/frida-server-{FRIDA_VER}-{FRIDA_ARCH}.xz"
+    LOCAL_XZ = LOCAL_DIR / f"frida-server-{FRIDA_VER}-{FRIDA_ARCH}.xz"
+
+    # Show configuration
     print("\nAndroid Security Tools - Cross-platform")
+    print("=" * 50)
+    print("[*] การตั้งค่า:")
+    print(f"    - Frida Version: {FRIDA_VER}")
+    print(f"    - Frida Architecture: {FRIDA_ARCH}" + (" (auto-detect)" if AUTO_DETECT_ARCH else ""))
+    print(f"    - Certificate File: {CERT_FILE}")
     print("=" * 50)
 
     try:
